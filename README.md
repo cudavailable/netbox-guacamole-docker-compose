@@ -10,9 +10,6 @@ git clone git@code.ykss.com.cn:dongxuexin/mynetbox.git
 # 进入项目所在目录
 cd ./mynetbox
 
-# 构建镜像，用于Apache反向代理服务
-docker compose build apache-oidc
-
 # docker部署
 docker compose up -d
 ```

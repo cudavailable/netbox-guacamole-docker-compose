@@ -227,26 +227,6 @@ services:
       options:
         max-size: "10m"
 
-  # 新增Apache反向代理服务（放在Guacamole服务前）
-  apache-oidc:
-    build:
-      context: ./apache
-      dockerfile: Dockerfile
-    container_name: apache_oidc
-    depends_on:
-      guacamole:
-        condition: service_healthy
-    ports:
-      - "8000:80"  # 使用HTTP端口 http://localhost:8000/guacamole
-    volumes:
-      # - ./apache/conf:/usr/local/apache2/conf
-      - ./apache/logs:/usr/local/apache2/logs
-      # - ./apache/certs:/etc/ssl  # SSL证书挂载 -> SSL禁用
-    networks:
-      - guacnetwork_compose
-    env_file: env/apache-oidc.env
-    restart: unless-stopped
-
   
 volumes:
   netbox-media-files:
