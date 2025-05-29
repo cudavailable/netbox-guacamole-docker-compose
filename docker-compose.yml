@@ -1,0 +1,268 @@
+services:
+  netbox: &netbox
+    image: docker.io/netboxcommunity/netbox:${VERSION-v4.3-3.3.0}
+    ports: 
+      - "9999:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+    env_file: env/netbox.env
+    user: "unit:root"
+    healthcheck:
+      test: curl -f http://localhost:8080/login/ || exit 1
+      start_period: 30s
+      timeout: 3s
+      interval: 15s
+      retries: 3
+    volumes:
+      - ./configuration:/etc/netbox/config:z,ro
+      - netbox-media-files:/opt/netbox/netbox/media:rw
+      - netbox-reports-files:/opt/netbox/netbox/reports:rw
+      - netbox-scripts-files:/opt/netbox/netbox/scripts:rw
+  netbox-worker:
+    <<: *netbox
+    # 添加以下配置，覆盖继承的ports
+    ports: []  # 明确声明不绑定任何端口
+    depends_on:
+      netbox:
+        condition: service_healthy
+    command:
+      - /opt/netbox/venv/bin/python
+      - /opt/netbox/netbox/manage.py
+      - rqworker
+    healthcheck:
+      test: ps -aux | grep -v grep | grep -q rqworker || exit 1
+      start_period: 20s
+      timeout: 3s
+      interval: 15s
+  netbox-housekeeping:
+    <<: *netbox
+    # 添加以下配置，覆盖继承的ports
+    ports: []  # 明确声明不绑定任何端口
+    depends_on:
+      netbox:
+        condition: service_healthy
+    command:
+      - /opt/netbox/housekeeping.sh
+    healthcheck:
+      test: ps -aux | grep -v grep | grep -q housekeeping || exit 1
+      start_period: 20s
+      timeout: 3s
+      interval: 15s
+
+  # postgres
+  postgres:
+    image: docker.io/postgres:17-alpine
+    healthcheck:
+      test: pg_isready -q -t 2 -d $$POSTGRES_DB -U $$POSTGRES_USER
+      start_period: 20s
+      timeout: 30s
+      interval: 10s
+      retries: 5
+    env_file: env/postgres.env
+    volumes:
+      - netbox-postgres-data:/var/lib/postgresql/data
+
+  # redis
+  redis:
+    image: docker.io/valkey/valkey:8.1-alpine
+    command:
+      - sh
+      - -c # this is to evaluate the $REDIS_PASSWORD from the env
+      - valkey-server --appendonly yes --requirepass $$REDIS_PASSWORD ## $$ because of docker-compose
+    healthcheck: &redis-healthcheck
+      test: '[ $$(valkey-cli --pass "$${REDIS_PASSWORD}" ping) = ''PONG'' ]'
+      start_period: 5s
+      timeout: 3s
+      interval: 1s
+      retries: 5
+    env_file: env/redis.env
+    volumes:
+      - netbox-redis-data:/data
+  redis-cache:
+    image: docker.io/valkey/valkey:8.1-alpine
+    command:
+      - sh
+      - -c # this is to evaluate the $REDIS_PASSWORD from the env
+      - valkey-server --requirepass $$REDIS_PASSWORD ## $$ because of docker-compose
+    healthcheck: *redis-healthcheck
+    env_file: env/redis-cache.env
+    volumes:
+      - netbox-redis-cache-data:/data
+
+  # 新增数据准备服务
+  prepare-data:
+    image: alpine:3.19  # 超轻量级镜像
+    working_dir: /app
+    volumes:
+      - ./prepare.sh:/app/prepare.sh  # 挂载准备脚本
+      - ./.setup-complete:/app/setup-complete  # 添加完成标记文件
+    networks:
+      - guacnetwork_compose
+    command: >
+      sh -c "
+        # 关键逻辑：如果标记文件不存在，才执行初始化
+        if [ ! -f /app/setup-complete ]; then
+          echo '首次运行：开始执行数据准备...'
+          apk update && apk add --no-cache dos2unix
+          chmod 755 /app/prepare.sh
+          dos2unix /app/prepare.sh
+          /app/prepare.sh
+          # 创建完成标记文件
+          echo '初始化完成' > /app/setup-complete
+          echo '数据准备成功！'
+        else
+          echo '跳过初始化：已存在完成标记文件'
+        fi
+      "
+    # command: > # test
+    #   sh -c "configs:
+    #     echo '首次运行'
+    #   "
+    restart: on-failure  # 失败时自动重试
+
+  # guacd
+  guacd:
+    container_name: guacd_compose
+    image: guacamole/guacd
+    # # 取消健康检查和依赖
+    # healthcheck:
+    #   test: ["CMD-SHELL", "ss -lnt | grep -q ':4822' || exit 1"]  # 检查 4822 端口是否监听
+    #   interval: 10s      # 每 10 秒检查一次
+    #   timeout: 5s        # 超时 5 秒
+    #   retries: 3         # 失败后重试 3 次才标记为不健康
+    #   start_period: 30s  # 容器启动后 20 秒开始检查
+    # depends_on:  # 数据准备脚本依赖配置
+    #   prepare-data:
+    #     condition: service_completed_successfully
+    networks:
+      - guacnetwork_compose
+    restart: always
+    volumes:
+    - ./drive:/drive:rw
+    - ./record:/record:rw
+
+  # postgres
+  postgres_guacamole:
+    container_name: postgres_guacamole_compose
+    ports:  # 宿主机Python脚本测试时，新增端口映射。测试完成后请注释
+      - "5432:5432"  # 宿主机端口:容器端口
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U guacamole_user -d guacamole_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    depends_on:  # 数据准备脚本依赖配置
+      prepare-data:
+        condition: service_completed_successfully
+    environment:
+      PGDATA: /var/lib/postgresql/data/guacamole
+      POSTGRES_DB: guacamole_db
+      POSTGRES_PASSWORD: 'ChooseYourOwnPasswordHere1234'
+      POSTGRES_USER: guacamole_user
+    image: postgres:15.2-alpine
+    networks:
+      - guacnetwork_compose
+    restart: always
+    volumes:
+    - ./init:/docker-entrypoint-initdb.d:z
+    - ./data:/var/lib/postgresql/data:Z
+
+  # guacamole
+  guacamole:
+    container_name: guacamole_compose
+    group_add:
+      - "1000"
+    depends_on:
+    - guacd
+    - postgres_guacamole
+      # # 修改依赖模式
+      # guacd:
+      #   condition: service_healthy
+      # postgres_guacamole:
+      #   condition: service_healthy
+    environment:
+      GUACD_HOSTNAME: guacd
+      POSTGRES_DATABASE: guacamole_db
+      POSTGRES_HOSTNAME: postgres_guacamole
+      POSTGRES_PASSWORD: 'ChooseYourOwnPasswordHere1234'
+      POSTGRES_USER: guacamole_user
+      RECORDING_SEARCH_PATH: /record
+    image: guacamole/guacamole
+    networks:
+      - guacnetwork_compose
+    volumes:
+      - ./record:/record:rw
+    ports:
+      -  8080:8080/tcp # Guacamole is on :8080/guacamole, not /.
+    healthcheck:  # Cron新增健康检查
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/guacamole || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+
+  # 脚本运行
+  script-runner:
+    image: python:slim-bookworm  # 基于 Debian Bookworm 的官方 Python 镜像
+    depends_on:  # 双重依赖保证顺序
+      prepare-data:
+        condition: service_completed_successfully
+      guacamole:
+        condition: service_healthy
+      netbox:
+        condition: service_healthy # Python脚本运行前的依赖
+    volumes:
+      - ./netbox_guacamole_sync.py:/app/netbox_guacamole_sync.py  # 挂载脚本文件
+    working_dir: /app
+    command: >  # 单命令实现依赖安装+循环执行
+      sh -c "pip install --no-cache-dir requests psycopg2-binary &&
+      while :; do python3 netbox_guacamole_sync.py; sleep 60; done"
+    restart: unless-stopped
+    logging:
+      options:
+        max-size: "10m"
+
+  # 新增Apache反向代理服务（放在Guacamole服务前）
+  apache-oidc:
+    build:
+      context: ./apache
+      dockerfile: Dockerfile
+    container_name: apache_oidc
+    depends_on:
+      guacamole:
+        condition: service_healthy
+    ports:
+      - "8000:80"  # 使用HTTP端口 http://localhost:8000/guacamole
+    volumes:
+      # - ./apache/conf:/usr/local/apache2/conf
+      - ./apache/logs:/usr/local/apache2/logs
+      # - ./apache/certs:/etc/ssl  # SSL证书挂载 -> SSL禁用
+    networks:
+      - guacnetwork_compose
+    env_file: env/apache-oidc.env
+    restart: unless-stopped
+
+  
+volumes:
+  netbox-media-files:
+    driver: local
+  netbox-postgres-data:
+    driver: local
+  netbox-redis-cache-data:
+    driver: local
+  netbox-redis-data:
+    driver: local
+  netbox-reports-files:
+    driver: local
+  netbox-scripts-files:
+    driver: local
+
+# Guacamole
+networks:
+  guacnetwork_compose:
+    driver: bridge
